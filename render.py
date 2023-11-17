@@ -20,6 +20,7 @@ from utils.general_utils import safe_state
 from argparse import ArgumentParser
 from arguments import ModelParams, PipelineParams, get_combined_args
 from gaussian_renderer import GaussianModel
+import datetime
 
 def render_set(model_path, name, iteration, views, gaussians, pipeline, background):
     render_path = os.path.join(model_path, name, "ours_{}".format(iteration), "renders")
@@ -58,6 +59,8 @@ if __name__ == "__main__":
     parser.add_argument("--skip_test", action="store_true")
     parser.add_argument("--quiet", action="store_true")
     args = get_combined_args(parser)
+
+    nowtime = datetime.datetime.now().strftime('%Y%m%d-%H%M%S')
     print("Rendering " + args.model_path)
 
     # Initialize system state (RNG)

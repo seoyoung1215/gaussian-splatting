@@ -22,6 +22,9 @@ from pathlib import Path
 from plyfile import PlyData, PlyElement
 from utils.sh_utils import SH2RGB
 from scene.gaussian_model import BasicPointCloud
+import pdb
+from scipy.spatial.transform import Rotation as R
+import pymap3d as pm
 
 class CameraInfo(NamedTuple):
     uid: int
@@ -71,12 +74,14 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder):
         sys.stdout.write('\r')
         # the exact output you're looking for:
         sys.stdout.write("Reading camera {}/{}".format(idx+1, len(cam_extrinsics)))
+        # pdb.set_trace()
         sys.stdout.flush()
 
-        extr = cam_extrinsics[key]
+        extr = cam_extrinsics[key]  # key = image_id
         intr = cam_intrinsics[extr.camera_id]
         height = intr.height
         width = intr.width
+        # pdb.set_trace()
 
         uid = intr.id
         R = np.transpose(qvec2rotmat(extr.qvec))
@@ -87,7 +92,7 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder):
             FovY = focal2fov(focal_length_x, height)
             FovX = focal2fov(focal_length_x, width)
         elif intr.model=="PINHOLE":
-            focal_length_x = intr.params[0]
+            focal_length_x = intr.params[0]  ## take focal length values for each image_id 
             focal_length_y = intr.params[1]
             FovY = focal2fov(focal_length_y, height)
             FovX = focal2fov(focal_length_x, width)
@@ -254,7 +259,178 @@ def readNerfSyntheticInfo(path, white_background, eval, extension=".png"):
                            ply_path=ply_path)
     return scene_info
 
+
+def read_metadata(json_paths):
+    metadata_dicts = []
+    for json_path in json_paths:
+        with open(json_path) as fid:
+            metadata_dict = json.load(fid)
+            metadata_dicts.append(metadata_dict)
+    return metadata_dicts
+
+def compute_centroid(metadata_dicts):
+    """
+    Compute coordinates (lat, lon, alt) of the centroid for an image collection.
+
+    :param metadata_dicts: list of metadata json dictionaries
+    :return: numpy array representing centroid (lat, lon, alt)
+    """
+    return np.array(
+        [
+            (
+                [
+                    metadata_dict["extrinsics"]["lat"],
+                    metadata_dict["extrinsics"]["lon"],
+                    metadata_dict["extrinsics"]["alt"],
+                ]
+            )
+            for metadata_dict in metadata_dicts
+        ]
+    ).mean(axis=0)
+
+def readCamerasFromWrivaJSON(path, pose_files, white_background):
+    cam_infos = []
+    metadata_dicts = read_metadata(pose_files)
+    origin = compute_centroid(metadata_dicts)
+    for idx, pose_file in enumerate(sorted(pose_files)):
+        with open(pose_file, "r") as fp:
+            meta = json.load(fp)
+        cam_name = os.path.join(path, meta["fname"])
+        intrinsics = meta["intrinsics"]
+        # dim = np.asarray([intrinsics['rows'], intrinsics['columns'], 3])
+        image_width = intrinsics['rows']  #1920
+        image_height = intrinsics['columns']  #1080
+        fx = intrinsics["fx"]#/resize_factor
+        if intrinsics["fy"]!= 0:
+            fy = intrinsics["fy"]#/resize_factor
+        else:
+            fy = intrinsics["fx"]#/resize_factor
+        # intrinsics_matrix = np.array([
+        #     [fx, 0, intrinsics["cx"], 0], # intrinsics["cx"]/resize_factor
+        #     [0, fy, intrinsics["cy"], 0], # intrinsics["cy"]/resize_factor
+        #     [0, 0, 1, 0],
+        #     [0, 0, 0, 1]
+        # ])
+
+        # rgb_file = os.path.join(input_images_path, meta["fname"])
+        # if not os.path.exists(rgb_file):
+        #     continue
+        # dims.append(dim)
+        # rgb_files.append(rgb_file)
+        
+        d = meta["extrinsics"]
+        r = (
+            R.from_matrix([[1, 0, 0], [0, -1, 0], [0, 0, -1]])
+            * R.from_euler(
+                "zyx",
+                [d["kappa"], d["phi"], d["omega"]],
+                degrees=True,
+            ).inv()
+        )
+        qvec = np.roll(r.as_quat(), 1)
+        tvec = r.apply(-np.array(pm.geodetic2enu(d["lat"], d["lon"], d["alt"], *origin)))
+
+        rotation = qvec2rotmat(qvec)
+        translation = tvec.reshape(3, 1)
+        w2c = np.concatenate([rotation, translation], 1)
+        w2c = np.concatenate([w2c, np.array([[0, 0, 0, 1]])], 0)
+        c2w = np.linalg.inv(w2c)
+
+        Rot = np.transpose(w2c[:3,:3])  # R is stored transposed due to 'glm' in CUDA code
+        Trans = w2c[:3, 3]
+
+        image_path = os.path.join(path, cam_name)
+        image_name = Path(cam_name).stem
+        image = Image.open(image_path)
+        # pdb.set_trace()
+
+        im_data = np.array(image.convert("RGBA"))
+
+        bg = np.array([1,1,1]) if white_background else np.array([0, 0, 0])
+
+        norm_data = im_data / 255.0
+        arr = norm_data[:,:,:3] * norm_data[:, :, 3:4] + bg * (1 - norm_data[:, :, 3:4])
+        image = Image.fromarray(np.array(arr*255.0, dtype=np.byte), "RGB")
+
+        # Calculate FOV in radians
+        FovX = focal2fov(fx, image_width) #2 * np.arctan(image_width / (2 * fx))
+        FovY = focal2fov(fy, image_height) # 2 * np.arctan(image_height / (2 * fy))
+
+    #     # Convert from COLMAP's camera coordinate system to ours
+    #     c2w[0:3, 1:3] *= -1
+    #     c2w = c2w[np.array([1, 0, 2, 3]), :]
+    #     c2w[2, :] *= -1
+
+    #     w2c_blender = np.linalg.inv(c2w)
+    #     w2c_opencv = w2c_blender
+    #     w2c_opencv[1:3] *= -1
+    #     c2w_opencv = np.linalg.inv(w2c_opencv)
+    #     c2w_mats.append(c2w_opencv)
+    # c2w_mats = np.array(c2w_mats)
+    # print(len(rgb_files),c2w_mats.shape, len(dims))
+    # return rgb_files, np.array([intrinsics_matrix] * len(rgb_files)), c2w_mats, dims
+
+        cam_infos.append(CameraInfo(uid=idx, R=Rot, T=Trans, FovY=FovY, FovX=FovX, image=image,
+                        image_path=image_path, image_name=image_name, width=image_width, height=image_height))
+            
+    return cam_infos
+
+
+def readMetadataInfo(path, white_background, eval, llffhold=8):
+    
+    # pose_files = [os.path.join(root, file) for root, dirs, files in os.walk(path) for file in files
+    #                     if file.endswith('.json')]
+    pose_files = [os.path.join(path, file) for file in os.listdir(path)
+                        if file.endswith('.json')] # use os.listdir instead of os.walk, to just search for .json in one current level (not going into bounding box folder)
+    print(path, len(pose_files))
+    # rgb_files, intrinsics, poses, dims = read_cameras(args.input_images, pose_files, self.resize_factor)
+    
+    cam_infos = readCamerasFromWrivaJSON(path, pose_files, white_background)
+    
+    if eval:
+        train_cam_infos = [c for idx, c in enumerate(cam_infos) if idx % llffhold != 0]
+        test_cam_infos = [c for idx, c in enumerate(cam_infos) if idx % llffhold == 0]
+    else:
+        train_cam_infos = cam_infos
+        test_cam_infos = []
+
+    # print("Reading Training Transforms")
+    # train_cam_infos = readCamerasFromTransforms(path, "transforms_train.json", white_background, extension)
+    # print("Reading Test Transforms")
+    # test_cam_infos = readCamerasFromTransforms(path, "transforms_test.json", white_background, extension)
+    
+    if not eval:
+        train_cam_infos.extend(test_cam_infos)
+        test_cam_infos = []
+
+    nerf_normalization = getNerfppNorm(train_cam_infos)
+
+    ply_path = os.path.join(path, "points3d.ply")
+    if not os.path.exists(ply_path):
+        # Since this data set has no colmap data, we start with random points
+        num_pts = 100_000
+        print(f"Generating random point cloud ({num_pts})...")
+        
+        # We create random points inside the bounds of the synthetic Blender scenes
+        xyz = np.random.random((num_pts, 3)) * 2.6 - 1.3
+        shs = np.random.random((num_pts, 3)) / 255.0
+        pcd = BasicPointCloud(points=xyz, colors=SH2RGB(shs), normals=np.zeros((num_pts, 3)))
+
+        storePly(ply_path, xyz, SH2RGB(shs) * 255)
+    try:
+        pcd = fetchPly(ply_path)
+    except:
+        pcd = None
+
+    scene_info = SceneInfo(point_cloud=pcd,
+                           train_cameras=train_cam_infos,
+                           test_cameras=test_cam_infos,
+                           nerf_normalization=nerf_normalization,
+                           ply_path=ply_path)
+    return scene_info
+
 sceneLoadTypeCallbacks = {
     "Colmap": readColmapSceneInfo,
-    "Blender" : readNerfSyntheticInfo
+    "Blender" : readNerfSyntheticInfo,
+    "Metadata" : readMetadataInfo
 }

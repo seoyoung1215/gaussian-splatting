@@ -17,6 +17,7 @@ from scene.dataset_readers import sceneLoadTypeCallbacks
 from scene.gaussian_model import GaussianModel
 from arguments import ModelParams
 from utils.camera_utils import cameraList_from_camInfos, camera_to_JSON
+import pdb
 
 class Scene:
 
@@ -39,12 +40,16 @@ class Scene:
 
         self.train_cameras = {}
         self.test_cameras = {}
+        # pdb.set_trace()
 
         if os.path.exists(os.path.join(args.source_path, "sparse")):
             scene_info = sceneLoadTypeCallbacks["Colmap"](args.source_path, args.images, args.eval)
         elif os.path.exists(os.path.join(args.source_path, "transforms_train.json")):
             print("Found transforms_train.json file, assuming Blender data set!")
             scene_info = sceneLoadTypeCallbacks["Blender"](args.source_path, args.white_background, args.eval)
+        elif any(file.endswith('.json') for file in os.listdir(args.source_path) if 'transforms' not in file):
+            print("Found other json files, assuming to use Wriva Metadata!")
+            scene_info = sceneLoadTypeCallbacks["Metadata"](args.source_path, args.white_background, args.eval)
         else:
             assert False, "Could not recognize scene type!"
 
